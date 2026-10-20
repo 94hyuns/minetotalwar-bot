@@ -1,6 +1,7 @@
 """영지전 디스코드 운영 봇 (docs/설계.md §33).
 
 - #버그제보·#건의사항: 새 글 → 스레드 + GitHub 이슈, 이슈 상태가 바뀌면 스레드에 알림
+  (BUG_PRIVATE=true 면 #버그제보 는 작성자만 보이는 비공개 스레드로 옮기고 원글을 지운다)
 - 이슈 ↔ 스레드 중계: 스레드 답글 → 이슈 댓글, 이슈 댓글 → 스레드 (5분마다). 이슈가 닫히면 스레드 잠금·보관
 - #건의사항: 하루 한 번 👍 수를 이슈 본문 첫 줄 "추천 N" 으로 갱신
 - #세력순위: 고정 메시지 하나를 export/factions.json 이 바뀔 때마다 편집
@@ -72,6 +73,8 @@ BUG_MODE = "auto" if os.getenv("BUG_MODE", "").strip().lower() == "auto" else "l
 NOTICE_WEBHOOK = os.getenv("NOTICE_WEBHOOK", "").strip()
 # 모드 제작자 공개 이슈 저장소 (owner/name). 비면 /상류·라벨 `상류` 가 꺼진다
 UPSTREAM_REPO = os.getenv("UPSTREAM_REPO", "94hyuns/minetotalwar-bot").strip()
+# #버그제보 를 비공개 스레드로 (기본 true). false 면 원글에 공개 스레드
+BUG_PRIVATE = os.getenv("BUG_PRIVATE", "true").strip().lower() not in ("false", "0", "no", "off")
 
 LABEL_BUG = "버그"
 LABEL_SUGGEST = "건의"
@@ -94,6 +97,8 @@ THUMBS_UP = "👍"
 
 STATUS_STALE_SECONDS = 180  # status.json 이 이보다 오래되면 서버가 꺼진 것으로 본다
 DISCORD_LIMIT = 2000
+MAX_REUPLOAD = 25 * 1024 * 1024  # 이보다 큰 첨부는 다시 올리지 않고 링크로 (서버 업로드 한도가 더 작으면 그쪽)
+BACKLOG_LIMIT = 50               # 기동 때 #버그제보 에 남은 글을 이만큼 훑는다
 RELAY_LIMIT = 1900  # 이슈 댓글을 스레드로 옮길 때 한 메시지 최대 글자
 
 
@@ -111,6 +116,7 @@ class State:
             "guide_message_ids": [],
             "votes_day": "",         # 마지막으로 추천 수를 갱신한 날 (KST, YYYY-MM-DD)
             "weekly_sent": "",       # 주간 집계를 보낸 주 (그 주 월요일 날짜, KST)
+            "private_pending": {},   # 비공개 접수 중인 원글 id → 만든 스레드 id (원글 삭제 전에 죽었을 때 정리용)
         }
         self.load()
 
@@ -439,6 +445,27 @@ class MtwBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("로그인: %s (id %s)", self.user, self.user.id if self.user else "?")
+        if BUG_PRIVATE and CHANNEL_BUG and not getattr(self, "_backlog_done", False):
+            self._backlog_done = True
+            try:
+                await self.process_bug_backlog()
+            except Exception:
+                log.exception("#버그제보 남은 글 처리 중 오류")
+
+    async def process_bug_backlog(self) -> None:
+        """봇이 꺼져 있던 동안(또는 원글 삭제 전에 죽어서) 채널에 남은 사람 글을 같은 절차로 옮긴다."""
+        channel = await self.fetch_channel_safe(CHANNEL_BUG)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        left = [m async for m in channel.history(limit=BACKLOG_LIMIT, oldest_first=False)
+                if not m.author.bot and m.type in (discord.MessageType.default, discord.MessageType.reply)]
+        for message in reversed(left):  # 오래된 것부터
+            try:
+                await self.intake_private(message)
+            except Exception:
+                log.exception("남은 버그 제보 %s 처리 실패", message.id)
+        if left:
+            log.info("#버그제보 에 남은 글 %d개를 처리했습니다.", len(left))
 
     async def fetch_channel_safe(self, channel_id: int) -> Any:
         if not channel_id:
@@ -462,7 +489,10 @@ class MtwBot(discord.Client):
             if isinstance(message.channel, discord.Thread):
                 await self.relay_reply(message)
             elif message.channel.id == CHANNEL_BUG and CHANNEL_BUG:
-                await self.intake(message, "bug")
+                if BUG_PRIVATE:
+                    await self.intake_private(message)
+                else:
+                    await self.intake(message, "bug")
             elif message.channel.id == CHANNEL_SUGGEST and CHANNEL_SUGGEST:
                 await self.intake(message, "suggest")
         except Exception:
@@ -548,6 +578,115 @@ class MtwBot(discord.Client):
         except discord.HTTPException:
             pass
         log.info("%s 접수 #%d (%s)", label, number, message.author)
+
+    async def intake_private(self, message: discord.Message) -> None:
+        """#버그제보 비공개 접수: 비공개 스레드(작성자만 초대) → 본문·첨부를 스레드로 옮김 → 원글 삭제 → 이슈 → "접수 #번호"."""
+        channel = message.channel
+        if not isinstance(channel, discord.TextChannel):
+            return
+        author = message.author
+        content = message.content.strip()
+        first_line = next((l.strip() for l in content.splitlines() if l.strip()), "") or "첨부 파일 제보"
+        pending: dict[str, int] = self.state.data.setdefault("private_pending", {})
+
+        # 지난번에 만들다 만 스레드가 있으면 지우고 다시 (원글이 남아 있다는 건 옮기기가 끝나지 않았다는 뜻)
+        stale = pending.get(str(message.id))
+        if stale:
+            old = await self.fetch_channel_safe(stale)
+            if isinstance(old, discord.Thread):
+                try:
+                    await old.delete()
+                except discord.HTTPException:
+                    pass
+
+        thread = await channel.create_thread(
+            name=clip(f"접수 중 · {author.display_name} · {first_line}", 100),
+            type=discord.ChannelType.private_thread, invitable=False, auto_archive_duration=10080)
+        pending[str(message.id)] = thread.id
+        self.state.save()
+        await thread.add_user(author)
+
+        # 첨부 다시 받기 (너무 크면 링크)
+        limit = min(MAX_REUPLOAD, getattr(channel.guild, "filesize_limit", MAX_REUPLOAD))
+        files: list[discord.File] = []
+        links: list[str] = []
+        for attachment in message.attachments:
+            if attachment.size <= limit:
+                try:
+                    files.append(await attachment.to_file())
+                    continue
+                except discord.HTTPException:
+                    log.warning("첨부 %s 를 받지 못해 링크로 남깁니다.", attachment.filename)
+            links.append(f"{attachment.filename}: <{attachment.url}>")
+
+        # 본문을 스레드 첫 메시지로 (2,000자 넘으면 나눔, 첨부는 마지막 조각에)
+        text = f"**{author.display_name}** 님의 제보\n{content or '(본문 없음)'}"
+        if links:
+            text += "\n\n크기가 커서 링크로 남긴 첨부:\n" + "\n".join(links)
+        pieces = [text[i:i + DISCORD_LIMIT] for i in range(0, len(text), DISCORD_LIMIT)] or [text]
+        copied: list[discord.Message] = []
+        for index, piece in enumerate(pieces):
+            last = index == len(pieces) - 1
+            try:
+                copied.append(await thread.send(piece, files=files if last and files else discord.utils.MISSING))
+            except discord.HTTPException:
+                if not (last and files):
+                    raise
+                # 합친 크기가 한도를 넘는 경우 등: 첨부 없이 올리고 원래 주소를 남긴다
+                fallback = piece + "\n\n(첨부를 다시 올리지 못했습니다)\n" + "\n".join(f"{a.filename}: <{a.url}>" for a in message.attachments)
+                copied.append(await thread.send(fallback[:DISCORD_LIMIT]))
+
+        await message.delete()
+        pending.pop(str(message.id), None)
+        self.state.save()
+
+        if not GITHUB_TOKEN:
+            await thread.send("접수했지만 이슈 연결이 설정되지 않았습니다. 관리자가 확인할게요.")
+            return
+
+        lines = [content or "(본문 없음)"]
+        uploaded = [a for m in copied for a in m.attachments]
+        if uploaded or links:
+            lines += ["", "### 첨부"]
+            for attachment in uploaded:
+                if (attachment.content_type or "").startswith("image/"):
+                    lines.append(f"![{attachment.filename}]({attachment.url})")
+                else:
+                    lines.append(f"- [{attachment.filename}]({attachment.url})")
+            lines += [f"- {link}" for link in links]
+        lines += [
+            "",
+            "---",
+            f"디스코드 작성자: {author.display_name} ({author.id})",
+            f"원문: {copied[0].jump_url}",
+        ]
+        try:
+            issue = await self.github.create_issue(clip(f"[{LABEL_BUG}] {first_line}", 120), "\n".join(lines), [LABEL_BUG])
+        except Exception:
+            log.exception("이슈 만들기 실패")
+            await thread.send("접수 중 문제가 생겼습니다. 관리자가 확인할게요.")
+            return
+
+        number = issue["number"]
+        self.state.issues[str(number)] = {
+            "kind": "bug",
+            "channel_id": thread.id,        # 👍 수는 스레드 첫 메시지에서 센다
+            "message_id": copied[0].id,
+            "thread_id": thread.id,
+            "closed": False,
+            "checking": False,
+            "on_hold": False,
+            "seen_comments": 0,
+            "last_comment_id": 0,
+            "votes": 0,
+        }
+        self.state.save()
+        try:
+            await thread.edit(name=clip(f"#{number} · {author.display_name} · {first_line}", 100))
+        except discord.HTTPException:
+            pass
+        await thread.send(f"접수 #{number} — 자동 처리 중" if BUG_MODE == "auto" else f"접수 #{number}")
+        log.info("버그 비공개 접수 #%d (%s)", number, author)
 
     # ── 이슈 상태 → 스레드 알림 (5분마다) ──
 
